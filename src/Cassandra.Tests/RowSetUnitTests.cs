@@ -20,7 +20,6 @@ using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Reflection;
@@ -90,10 +89,7 @@ namespace Cassandra.Tests
             //It has paging state, stating that there are more pages
             rs.PagingState = new byte[] { 0 };
             //Add a handler to fetch next
-            rs.FetchNextPage = (pagingState) =>
-            {
-                return CreateStringsRowset(1, 1, "b_");
-            };
+            SetFetchNextMethod(rs, pagingState => CreateStringsRowset(1, 1, "b_"));
 
             //use linq to iterate and map it to a list
             var rowList = rs.ToList();
@@ -113,11 +109,11 @@ namespace Cassandra.Tests
             rs.PagingState = new byte[] { 0 };
             //Add a handler to fetch next
             var called = false;
-            rs.FetchNextPage = (pagingState) =>
+            SetFetchNextMethod(rs, (pagingState) =>
             {
                 called = true;
                 return CreateStringsRowset(1, 1, "b_");
-            };
+            });
 
             //use linq to iterate and map it to a list
             var rowList = rs.ToList();
@@ -135,10 +131,7 @@ namespace Cassandra.Tests
             //It has paging state, stating that there are more pages.
             rs.PagingState = new byte[] { 0 };
             //Throw a test exception when fetching the next page.
-            rs.FetchNextPage = (pagingState) =>
-            {
-                throw new TestException();
-            };
+            rs.SetFetchNextPageHandler(pagingState => throw new TestException(), int.MaxValue);
 
             //use linq to iterate and map it to a list
             //The row set should throw an exception when getting the next page.
@@ -154,11 +147,11 @@ namespace Cassandra.Tests
         {
             var rowLength = 10;
             var rs = CreateStringsRowset(2, rowLength);
-            rs.FetchNextPage = (pagingState) =>
+            SetFetchNextMethod(rs, (pagingState) =>
             {
                 Assert.Fail("Event to get next page must not be called as there is no paging state.");
-                return null;
-            };
+                return (RowSet)null;
+            });
             //Use Linq to iterate
             var rowsFirstIteration = rs.ToList();
             Assert.AreEqual(rowLength, rowsFirstIteration.Count);
@@ -183,13 +176,13 @@ namespace Cassandra.Tests
             var rs = CreateStringsRowset(10, pageSize);
             rs.PagingState = new byte[0];
             var fetchCounter = 0;
-            rs.FetchNextPage = (pagingState) =>
+            SetFetchNextMethod(rs, (pagingState) =>
             {
                 fetchCounter++;
                 //fake a fetch
                 Thread.Sleep(1000);
                 return CreateStringsRowset(10, pageSize);
-            };
+            });
             var counterList = new ConcurrentBag<int>();
             Action iteration = () =>
             {
@@ -221,22 +214,13 @@ namespace Cassandra.Tests
             var rs = CreateStringsRowset(10, rowLength, "page_0_");
             rs.PagingState = new byte[0];
             var fetchCounter = 0;
-            rs.FetchNextPage = (pagingState) =>
+            SetFetchNextMethod(rs, (pagingState) =>
             {
                 fetchCounter++;
                 var pageRowSet = CreateStringsRowset(10, rowLength, "page_" + fetchCounter + "_");
-                if (fetchCounter < 3)
-                {
-                    //when retrieving the pages, state that there are more results
-                    pageRowSet.PagingState = new byte[0];
-                }
-                else
-                {
-                    //On the 3rd page, state that there aren't any more pages.
-                    pageRowSet.PagingState = null;
-                }
+                pageRowSet.PagingState = fetchCounter < 3 ? new byte[0] : null;
                 return pageRowSet;
-            };
+            });
 
             //Use Linq to iterate
             var rows = rs.ToList();
@@ -259,7 +243,7 @@ namespace Cassandra.Tests
             var rs = CreateStringsRowset(10, rowLength, "page_0_");
             rs.PagingState = new byte[0];
             var fetchCounter = 0;
-            rs.FetchNextPage = (pagingState) =>
+            SetFetchNextMethod(rs, (pagingState) =>
             {
                 fetchCounter++;
                 var pageRowSet = CreateStringsRowset(10, rowLength, "page_" + fetchCounter + "_");
@@ -278,7 +262,7 @@ namespace Cassandra.Tests
                     throw new Exception("It should not be called more than 3 times.");
                 }
                 return pageRowSet;
-            };
+            });
             Assert.AreEqual(rowLength * 1, rs.InnerQueueCount);
             rs.FetchMoreResults();
             Assert.AreEqual(rowLength * 2, rs.InnerQueueCount);
@@ -641,6 +625,16 @@ namespace Cassandra.Tests
                 Assert.AreEqual(item.Item1.First().Ticks,
                     (from object v in (IEnumerable)value select (v is DateTime ? ((DateTime)v).Ticks : ((DateTimeOffset)v).Ticks)).FirstOrDefault());
             }
+        }
+
+        private static void SetFetchNextMethod(RowSet rs, Func<byte[], Task<RowSet>> handler)
+        {
+            rs.SetFetchNextPageHandler(handler, 10000);
+        }
+
+        private static void SetFetchNextMethod(RowSet rs, Func<byte[], RowSet> handler)
+        {
+            SetFetchNextMethod(rs, pagingState => Task.FromResult(handler(pagingState)));
         }
 
         private class TestException : Exception { }

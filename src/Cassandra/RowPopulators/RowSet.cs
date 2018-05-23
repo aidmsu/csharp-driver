@@ -15,11 +15,13 @@
 //
 
 using System;
-using System.Linq;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
+using Cassandra.Tasks;
+
 // ReSharper disable DoNotCallOverridableMethodsInConstructor
 // ReSharper disable CheckNamespace
 
@@ -51,13 +53,11 @@ namespace Cassandra
     public class RowSet : IEnumerable<Row>, IDisposable
     {
         private static readonly CqlColumn[] EmptyColumns = new CqlColumn[0];
-        private readonly object _pageLock = new object();
-        private Func<byte[], RowSet> _fetchNextPage;
-        // ReSharper disable once InconsistentNaming
-        /// <summary>
-        /// Contains the PagingState keys of the pages already retrieved.
-        /// </summary>
-        protected ConcurrentDictionary<byte[], bool> _pagers;
+        private volatile Func<byte[], Task<RowSet>> _fetchNextPage;
+        private volatile byte[] _pagingState;
+        private int _isPaging;
+        private volatile Task _currentFetchNextPageTask;
+        private volatile int _pageSyncAbortTimeout = Timeout.Infinite;
 
         /// <summary>
         /// Determines if when dequeuing, it will automatically fetch the following result pages.
@@ -65,25 +65,16 @@ namespace Cassandra
         protected internal bool AutoPage { get; set; }
 
         /// <summary>
-        /// Delegate that is called to get the next page.
+        /// Sets the method that is called to get the next page.
         /// </summary>
-        protected internal Func<byte[], RowSet> FetchNextPage
+        internal void SetFetchNextPageHandler(Func<byte[], Task<RowSet>> handler, int pageSyncAbortTimeout)
         {
-            get { return _fetchNextPage; }
-            set
+            if (_fetchNextPage != null)
             {
-                if (_fetchNextPage != null)
-                {
-                    throw new InvalidOperationException("Multiple sets to FetchNextPage not supported");
-                }
-                if (value != null)
-                {
-                    // ReSharper disable once InconsistentlySynchronizedField
-                    // The getter is called outside synchronization
-                    _pagers = new ConcurrentDictionary<byte[], bool>(1, 1);
-                }
-                _fetchNextPage = value;
+                throw new InvalidOperationException("Multiple sets to FetchNextPage not supported");
             }
+            _fetchNextPage = handler;
+            _pageSyncAbortTimeout = pageSyncAbortTimeout;
         }
 
         /// <summary>
@@ -94,7 +85,7 @@ namespace Cassandra
         /// <summary>
         /// Gets the amount of items in the internal queue. For testing purposes.
         /// </summary>
-        internal int InnerQueueCount { get { return RowQueue.Count; } }
+        internal int InnerQueueCount => RowQueue.Count;
 
         /// <summary>
         /// Gets the execution info of the query
@@ -110,12 +101,17 @@ namespace Cassandra
         /// Gets or sets the paging state of the query for the RowSet.
         /// When set it states that there are more pages.
         /// </summary>
-        public virtual byte[] PagingState { get; set; }
+        public virtual byte[] PagingState
+        {
+            get => _pagingState;
+            protected internal set => _pagingState = value;
+        }
 
         /// <summary>
         /// Returns whether this ResultSet has more results.
         /// It has side-effects, if the internal queue has been consumed it will page for more results.
         /// </summary>
+        /// <seealso cref="IsFullyFetched"/>
         public virtual bool IsExhausted()
         {
             if (RowQueue == null)
@@ -133,13 +129,7 @@ namespace Cassandra
         /// <summary>
         /// Whether all results from this result set has been fetched from the database.
         /// </summary>
-        public virtual bool IsFullyFetched 
-        { 
-            get
-            {
-                return PagingState == null || !AutoPage;
-            } 
-        }
+        public virtual bool IsFullyFetched => PagingState == null || !AutoPage;
 
         /// <summary>
         /// Creates a new instance of RowSet.
@@ -157,7 +147,7 @@ namespace Cassandra
         {
             if (!isVoid)
             {
-                RowQueue = new ConcurrentQueue<Row>();   
+                RowQueue = new ConcurrentQueue<Row>();
             }
             Info = new ExecutionInfo();
             Columns = EmptyColumns;
@@ -195,9 +185,56 @@ namespace Cassandra
         /// <summary>
         /// Force the fetching the next page of results without blocking for this result set, if any.
         /// </summary>
-        public Task FetchMoreResultsAsync()
+        public async Task FetchMoreResultsAsync()
         {
-            return Task.Factory.StartNew(FetchMoreResults);
+            var pageState = _pagingState;
+            if (pageState == null || !AutoPage)
+            {
+                return;
+            }
+
+            // Only one concurrent call to page
+            Task task;
+            if (Interlocked.CompareExchange(ref _isPaging, 1, 0) != 0)
+            {
+                // Once isPaging flag is set, task will be set shortly
+                var spin = new SpinWait();
+                while ((task = _currentFetchNextPageTask) == null)
+                {
+                    // Use busy spin as the task should be set immediately after
+                    // There is no risk on task being null after that
+                    spin.SpinOnce();
+                }
+
+                await task.ConfigureAwait(false);
+                return;
+            }
+
+            task = FetchAndEnqueueRows(pageState);
+            _currentFetchNextPageTask = task;
+
+            try
+            {
+                await task.ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _isPaging, 0);
+            }
+        }
+
+        private async Task FetchAndEnqueueRows(byte[] pagingState)
+        {
+            var fetchMethod = _fetchNextPage ??
+                              throw new DriverInternalError("Paging state set but delegate to retrieve is not");
+
+            var rs = await fetchMethod(pagingState).ConfigureAwait(false);
+            foreach (var newRow in rs.RowQueue)
+            {
+                RowQueue.Enqueue(newRow);
+            }
+
+            PagingState = rs.PagingState;
         }
 
         /// <summary>
@@ -205,7 +242,7 @@ namespace Cassandra
         /// </summary>
         public int GetAvailableWithoutFetching()
         {
-            return RowQueue == null ? 0 : RowQueue.Count;
+            return RowQueue?.Count ?? 0;
         }
 
         /// <summary>
@@ -244,37 +281,7 @@ namespace Cassandra
         /// </summary>
         protected virtual void PageNext()
         {
-            if (IsFullyFetched)
-            {
-                return;
-            }
-            if (FetchNextPage == null)
-            {
-                //There is no handler, clear the paging state
-                this.PagingState = null;
-                return;
-            }
-            lock (_pageLock)
-            {
-                var pageState = this.PagingState;
-                if (pageState == null)
-                {
-                    return;
-                }
-                bool value;
-                bool alreadyPresent = _pagers.TryGetValue(pageState, out value);
-                if (alreadyPresent)
-                {
-                    return;
-                }
-                var rs = FetchNextPage(pageState);
-                foreach (var newRow in rs.RowQueue)
-                {
-                    RowQueue.Enqueue(newRow);
-                }
-                PagingState = rs.PagingState;
-                _pagers.AddOrUpdate(pageState, true, (k, v) => v);
-            }
+            TaskHelper.WaitToComplete(FetchMoreResultsAsync(), _pageSyncAbortTimeout);
         }
 
         /// <summary>
